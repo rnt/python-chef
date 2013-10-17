@@ -69,7 +69,7 @@ class ChefAPI(object):
     ruby_value_re = re.compile(r'#\{([^}]+)\}')
     env_value_re = re.compile(r'ENV\[(.+)\]')
 
-    def __init__(self, url, key, client, version='0.10.8', headers={}):
+    def __init__(self, url, key, client, version='0.10.8', headers={}, secret_file=None):
         self.url = url.rstrip('/')
         self.parsed_url = urlparse.urlparse(self.url)
         if not isinstance(key, Key):
@@ -82,6 +82,12 @@ class ChefAPI(object):
         self.platform = self.parsed_url.hostname == 'api.opscode.com'
         if not api_stack_value():
             self.set_default()
+        self.encryption_key = None
+        if secret_file is not None:
+            self.secret_file = secret_file
+            if os.path.exists(self.secret_file):
+                self.encryption_key = open(self.secret_file).read().strip()
+
 
     @classmethod
     def from_config_file(cls, path):
@@ -93,7 +99,7 @@ class ChefAPI(object):
             # Can't even read the config file
             log.debug('Unable to read config file "%s"', path)
             return
-        url = key_path = client_name = None
+        url = key_path = client_name = secret_file = None
         for line in open(path):
             if not line.strip() or line.startswith('#'):
                 continue # Skip blanks and comments
@@ -128,6 +134,12 @@ class ChefAPI(object):
                 if not os.path.isabs(key_path):
                     # Relative paths are relative to the config file
                     key_path = os.path.abspath(os.path.join(os.path.dirname(path), key_path))
+            elif key == 'secret_file':
+                log.debug('Found secret_file: %r', value)
+                secret_file = value
+                if os.path.exists(secret_file):
+                    secret_file = open(secret_file).read()
+
         if not (url and client_name and key_path):
             # No URL, no chance this was valid, try running Ruby
             log.debug('No Chef server config found, trying Ruby parse')
@@ -156,7 +168,7 @@ class ChefAPI(object):
             return
         if not client_name:
             client_name = socket.getfqdn()
-        return cls(url, key_path, client_name)
+        return cls(url, key_path, client_name, secret_file)
 
     @staticmethod
     def get_global():
