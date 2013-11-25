@@ -1,6 +1,7 @@
 from chef.exceptions import ChefUnsupportedEncryptionVersionError, ChefDecryptionError
-from Crypto.Cipher import AES
+from M2Crypto.EVP import Cipher
 
+import os
 import hmac
 import base64
 import chef
@@ -9,12 +10,19 @@ import simplejson as json
 
 class EncryptedDataBagItem(chef.DataBagItem):
     SUPPORTED_ENCRYPTION_VERSIONS = (1,2)
+    AES_MODE = 'aes_256_cbc'
 
     def __getitem__(self, key):
         if key == 'id':
             return self.raw_data[key]
         else:
             return EncryptedDataBagItem.Decryptors.create_decryptor(self.api.encryption_key, self.raw_data[key]).decrypt()
+
+    def __setitem__(self, key, value):
+        if key == 'id':
+            self.raw_data[key] = value
+        else:
+            self.raw_data[key] = EncryptedDataBagItem.Encryptors.create_encryptor(self.api.encryption_key, value, 1).to_dict()
 
     @staticmethod
     def get_version(data):
@@ -27,29 +35,64 @@ class EncryptedDataBagItem(chef.DataBagItem):
             # Should be 0 after implementing DecryptorVersion0
             return "1"
 
+    class Encryptors(object):
+        @staticmethod
+        def create_encryptor(key, data, version):
+            try:
+                return {
+                    1: EncryptedDataBagItem.Encryptors.EncryptorVersion1(key, data)
+                    }[version]
+            except KeyError:
+                raise ChefUnsupportedEncryptionVersionError(version)
+
+        class EncryptorVersion1(object):
+            VERSION = 1
+            def __init__(self, key, data):
+                self.key = hashlib.sha256(key).digest()
+                self.data = data
+                self.iv = os.urandom(8).encode('hex')
+                self.encryptor = Cipher(alg=EncryptedDataBagItem.AES_MODE, key=self.key, iv=self.iv, op=1)
+                self.encrypted_data = None
+
+            def encrypt(self):
+                if self.encrypted_data is None:
+                    data = json.dumps({'json_wrapper': self.data})
+                    self.encrypted_data = self.encryptor.update(data) + self.encryptor.final()
+                    del self.encryptor
+                return self.encrypted_data
+
+            def to_dict(self):
+                return {
+                        "encrypted_data": base64.standard_b64encode(self.encrypt()),
+                        "iv": base64.standard_b64encode(self.iv),
+                        "version": self.VERSION,
+                        "cipher": "aes-256-cbc"
+                        }
+
     class Decryptors(object):
-        AES_MODE = AES.MODE_CBC
-        STRIP_CHARS =  map(chr,range(0,31))
+        STRIP_CHARS = map(chr,range(0,31))
 
         @staticmethod
         def create_decryptor(key, data):
-            return {
-                1: EncryptedDataBagItem.Decryptors.DecryptorVersion1(key, data['encrypted_data'], data['iv']),
-                2: EncryptedDataBagItem.Decryptors.DecryptorVersion2(key, data['encrypted_data'], data['iv'], data['hmac'])
-                }[EncryptedDataBagItem.get_version(data)]
+            version = EncryptedDataBagItem.get_version(data)
+            if version == 1:
+                return EncryptedDataBagItem.Decryptors.DecryptorVersion1(key, data['encrypted_data'], data['iv'])
+            elif version == 2:
+                return EncryptedDataBagItem.Decryptors.DecryptorVersion2(key, data['encrypted_data'], data['iv'], data['hmac'])
 
         class DecryptorVersion1(object):
             def __init__(self, key, data, iv):
                 self.key = hashlib.sha256(key).digest()
                 self.data = base64.standard_b64decode(data)
                 self.iv = base64.standard_b64decode(iv)
-                self.decryptor = AES.new(self.key, EncryptedDataBagItem.Decryptors.AES_MODE, self.iv)
+                self.decryptor = Cipher(alg=EncryptedDataBagItem.AES_MODE, key=self.key, iv=self.iv, op=0)
 
             def decrypt(self):
-                value = self.decryptor.decrypt(self.data)
-                # Strip all the whitespace and sequence controll characters
+                value = self.decryptor.update(self.data) + self.decryptor.final()
+                del self.decryptor
+                # Strip all the whitespace and sequence control characters
                 value = value.strip(reduce(lambda x,y: "%s%s" % (x,y), EncryptedDataBagItem.Decryptors.STRIP_CHARS))
-                # After decryption we should get a JSON string
+                # After decryption we should get a string with JSON
                 try:
                     value = json.loads(value)
                 except ValueError:
